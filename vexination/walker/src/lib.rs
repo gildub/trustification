@@ -5,17 +5,20 @@ use std::{
     path::PathBuf,
     process::ExitCode,
     str::FromStr,
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 
-use prometheus::Registry;
 use time::{Date, Month, UtcOffset};
-use trustification_auth::client::OpenIdTokenProviderConfigArguments;
+use trustification_auth::client::{OpenIdTokenProviderConfig, OpenIdTokenProviderConfigArguments};
 use trustification_infrastructure::{Infrastructure, InfrastructureConfig};
 use url::Url;
+use walker_common::sender::provider::TokenProvider;
 use walker_common::validate::ValidationOptions;
 
-mod server;
+use crate::scanner::{Options, Scanner};
+
+mod scanner;
 
 #[derive(clap::Args, Debug)]
 #[command(about = "Run the api server", args_conflicts_with_subcommands = true)]
@@ -65,6 +68,18 @@ pub struct Run {
     /// Only upload if a document's name has any of these prefixes.
     #[arg(long = "require-prefix")]
     pub required_prefixes: Vec<String>,
+
+    /////
+    /// Retry sending a file
+    #[arg(long = "retries", default_value_t = 5)]
+    pub retries: usize,
+
+    /// Retry delay
+    pub retry_delay: Option<humantime::Duration>,
+
+    /// Long-running mode. The index file will be scanned for changes every interval.
+    #[arg(long = "scan-interval")]
+    pub scan_interval: Option<humantime::Duration>,
 }
 
 impl Run {
@@ -74,8 +89,6 @@ impl Run {
                 "vexination-walker",
                 |_context| async { Ok(()) },
                 |context| async move {
-                    let provider = self.oidc.clone().into_provider_or_devmode(self.devmode).await?;
-
                     let validation_date: Option<SystemTime> = match (self.policy_date, self.v3_signatures) {
                         (_, true) => Some(SystemTime::from(
                             Date::from_calendar_date(2007, Month::January, 1)
@@ -89,23 +102,51 @@ impl Run {
 
                     log::debug!("Policy date: {validation_date:?}");
 
-                    let options = ValidationOptions { validation_date };
+                    let provider = match OpenIdTokenProviderConfig::from_args_or_devmode(self.oidc, self.devmode) {
+                        Some(OpenIdTokenProviderConfig {
+                            issuer_url,
+                            client_id,
+                            client_secret,
+                            refresh_before,
+                            tls_insecure: insecure_tls,
+                        }) => {
+                            let config = walker_common::sender::provider::OpenIdTokenProviderConfig {
+                                issuer_url,
+                                client_id,
+                                client_secret,
+                                refresh_before,
+                                tls_insecure: insecure_tls,
+                            };
+                            Arc::new(walker_common::sender::provider::OpenIdTokenProvider::with_config(config).await?)
+                                as Arc<dyn TokenProvider>
+                        }
+                        None => Arc::new(()),
+                    };
 
-                    server::run(
-                        self.workers,
-                        self.source,
-                        self.sink,
+                    let scanner = Scanner::new(Options {
+                        source: self.source,
+                        target: self.sink.join("/api/v1/vex")?,
                         provider,
-                        options,
-                        self.ignore_distributions,
-                        self.since_file,
-                        self.additional_root_certificates,
-                        self.required_prefixes,
-                    )
-                    .await
+                        validation_date,
+                        since_file: self.since_file,
+                        additional_root_certificates: self.additional_root_certificates,
+                        required_prefixes: self.required_prefixes,
+                        retries: self.retries,
+                        retry_delay: self.retry_delay.map(|d| d.into()),
+                        ignore_distributions: self.ignore_distributions,
+                    });
+
+                    if let Some(interval) = self.scan_interval {
+                        scanner.run(interval.into()).await?;
+                    } else {
+                        scanner.run_once().await?;
+                    }
+
+                    Ok(())
                 },
             )
             .await?;
+
         Ok(ExitCode::SUCCESS)
     }
 }
